@@ -1,0 +1,105 @@
+#pragma kernel ClearTotals
+#pragma kernel ReduceAtomic
+#pragma kernel ReduceGroupShared
+#pragma kernel ReduceWave
+
+#pragma use_dxc
+#pragma require wavebasic
+
+#define GROUP_SIZE 256
+#define MAX_WAVES (GROUP_SIZE / 4)
+#define LUMA float3(0.2126, 0.7152, 0.0722)
+
+Texture2D<float4> _Source;
+uint _Width;
+uint _PixelCount;
+float _AtomicScale;
+
+RWStructuredBuffer<uint> _Totals;
+RWStructuredBuffer<float2> _Partials;
+
+float LoadLuma(uint index)
+{
+    if (index >= _PixelCount)
+        return 0;
+    uint2 p = uint2(index % _Width, index / _Width);
+    return dot(_Source.Load(int3(p, 0)).rgb, LUMA);
+}
+
+[numthreads(1, 1, 1)]
+void ClearTotals()
+{
+    _Totals[0] = 0;
+    _Totals[1] = 0;
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ReduceAtomic(uint3 id : SV_DispatchThreadID)
+{
+    float l = LoadLuma(id.x);
+    InterlockedAdd(_Totals[0], (uint)(l * _AtomicScale + 0.5));
+    InterlockedMax(_Totals[1], asuint(l));
+}
+
+groupshared float gsSum[GROUP_SIZE];
+groupshared float gsMax[GROUP_SIZE];
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ReduceGroupShared(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    float l = LoadLuma(id.x);
+    gsSum[gi] = l;
+    gsMax[gi] = l;
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint s = GROUP_SIZE / 2; s > 0; s >>= 1)
+    {
+        if (gi < s)
+        {
+            gsSum[gi] += gsSum[gi + s];
+            gsMax[gi] = max(gsMax[gi], gsMax[gi + s]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0)
+        _Partials[gid.x] = float2(gsSum[0], gsMax[0]);
+}
+
+groupshared float gsWaveSum[MAX_WAVES];
+groupshared float gsWaveMax[MAX_WAVES];
+groupshared uint gsWaveCount;
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void ReduceWave(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    if (gi == 0)
+        gsWaveCount = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    float l = LoadLuma(id.x);
+    float waveSum = WaveActiveSum(l);
+    float waveMax = WaveActiveMax(l);
+
+    if (WaveIsFirstLane())
+    {
+        uint slot;
+        InterlockedAdd(gsWaveCount, 1, slot);
+        gsWaveSum[slot] = waveSum;
+        gsWaveMax[slot] = waveMax;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (gi == 0)
+    {
+        float s = 0;
+        float m = 0;
+        for (uint i = 0; i < gsWaveCount; i++)
+        {
+            s += gsWaveSum[i];
+            m = max(m, gsWaveMax[i]);
+        }
+        _Partials[gid.x] = float2(s, m);
+    }
+}
